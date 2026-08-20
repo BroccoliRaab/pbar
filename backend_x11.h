@@ -19,7 +19,7 @@
 typedef struct {
     xcb_window_t window;
     xcb_gcontext_t gc;
-    xcb_shm_seg_t shm_seg;
+    xcb_shm_seg_t shm_seg[2];
     bool mapped;
 } x11_state_t;
 
@@ -62,7 +62,7 @@ static void x11_update(pbar_output_t *out) {
         24,
         XCB_IMAGE_FORMAT_Z_PIXMAP,
         0,
-        st->shm_seg,
+        st->shm_seg[out->current_buf],
         0
     );
     xcb_flush(conn);
@@ -212,15 +212,16 @@ static int backend_run(void) {
 
     x11_state_t *st = out_node->b_state;
 
-    /* Use unified init_shm (memfd) */
     if (init_shm(out_node) < 0) {
-        die("failed to initialize SHM buffer for X11 output");
+        die("failed to initialize SHM buffers for X11 output");
         goto out_conn;
     }
 
-    /* Attach modern X11 memfd-backed shared memory via FD extension */
-    st->shm_seg = xcb_generate_id(conn);
-    xcb_shm_attach_fd(conn, st->shm_seg, out_node->shm_fd, 0);
+    /* Attach BOTH memfd segments to the X server */
+    for (int i = 0; i < 2; i++) {
+        st->shm_seg[i] = xcb_generate_id(conn);
+        xcb_shm_attach_fd(conn, st->shm_seg[i], out_node->shm_fd[i], 0);
+    }
 
     /* Create X11 Bar Window */
     st->window = xcb_generate_id(conn);
@@ -265,7 +266,6 @@ static int backend_run(void) {
     struct pollfd pfd = { .fd = x11_fd, .events = POLLIN };
 
     while (running) {
-        /* Wake up at least every 1000ms so clock and exec elements can update */
         if (poll(&pfd, 1, 1000) < 0) {
             if (errno == EINTR && !running) break;
             continue;
@@ -303,7 +303,7 @@ static int backend_run(void) {
             free(ev);
         }
 
-        /* Unconditionally redraw the bar (handles XCB_EXPOSE naturally, plus clock ticks) */
+        /* Draw handles the pointer swap internally, then x11_update reads the new buffer */
         draw_output(out_node);
         x11_update(out_node);
     }
@@ -320,17 +320,26 @@ out_conn:
 
     for (pbar_output_t *out = outputs; out; ) {
         pbar_output_t *next = out->next;
-        x11_state_t *st = out->b_state;
-        if (st) {
-            if (st->shm_seg) xcb_shm_detach(conn, st->shm_seg);
-            if (st->gc) xcb_free_gc(conn, st->gc);
-            if (st->window) xcb_destroy_window(conn, st->window);
-            free(st);
+        x11_state_t *state = out->b_state;
+        
+        if (state) {
+            if (state->gc) xcb_free_gc(conn, state->gc);
+            if (state->window) xcb_destroy_window(conn, state->window);
+            
+            /* Detach BOTH memfd segments */
+            for (int i = 0; i < 2; i++) {
+                if (state->shm_seg[i]) {
+                    xcb_shm_detach(conn, state->shm_seg[i]);
+                }
+            }
+            free(state);
         }
         
-        /* Cleanup memfd mappings unified by init_shm */
-        if (out->pixels) munmap(out->pixels, out->shm_size);
-        if (out->shm_fd >= 0) close(out->shm_fd);
+        /* Unmap and close BOTH buffers cleanly */
+        for (int i = 0; i < 2; i++) {
+            if (out->shm_pixels[i]) munmap(out->shm_pixels[i], out->shm_size);
+            if (out->shm_fd[i] >= 0) close(out->shm_fd[i]);
+        }
         
         free(out);
         out = next;

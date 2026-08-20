@@ -35,29 +35,33 @@ static void handle_signal(int sig) {
 }
 
 int init_shm(pbar_output_t *out) {
-    int r = -1;
-
     out->shm_size = out->width * out->height * 4;
-    out->shm_fd = memfd_create("pbar_pixels", MFD_CLOEXEC);
-    if (out->shm_fd < 0) goto out;
+    out->current_buf = 0;
 
-    if (ftruncate(out->shm_fd, out->shm_size) < 0) goto out_close_fd;
+    for (int i = 0; i < 2; i++) {
+        out->shm_fd[i] = memfd_create("pbar_pixels", MFD_CLOEXEC);
+        if (out->shm_fd[i] < 0) goto err;
 
-    out->pixels = mmap(NULL, out->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, out->shm_fd, 0);
-    if (out->pixels == MAP_FAILED) {
-        out->pixels = NULL;
-        goto out_close_fd;
+        if (ftruncate(out->shm_fd[i], out->shm_size) < 0) goto err;
+
+        out->shm_pixels[i] = mmap(NULL, out->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, out->shm_fd[i], 0);
+        if (out->shm_pixels[i] == MAP_FAILED) {
+            out->shm_pixels[i] = NULL;
+            goto err;
+        }
+
+        memset(out->shm_pixels[i], 0, out->shm_size);
     }
 
-    memset(out->pixels, 0, out->shm_size);
-    r = 0;
-    return r;
+    out->pixels = out->shm_pixels[0];
+    return 0;
 
-out_close_fd:
-    close(out->shm_fd);
-    out->shm_fd = -1;
-out:
-    return r;
+err:
+    for (int i = 0; i < 2; i++) {
+        if (out->shm_pixels[i]) munmap(out->shm_pixels[i], out->shm_size);
+        if (out->shm_fd[i] >= 0) close(out->shm_fd[i]);
+    }
+    return -1;
 }
 
 /* --- Display Server Injection --- */
@@ -344,23 +348,26 @@ pbar_element_t *elements[] = {
 /* ========================================================================= */
 /* --- Immediate Mode Drawing System ---                                     */
 /* ========================================================================= */
-
 void draw_output(pbar_output_t *out) {
-    if (!out || !out->pixels || out->width <= 0 || out->height <= 0) return;
+    if (!out || out->width <= 0 || out->height <= 0) return;
 
-    /* Clear canvas */
+    /* 1. Swap buffer handles (Zero-copy flip) */
+    out->current_buf = (out->current_buf + 1) % 2;
+    out->pixels = out->shm_pixels[out->current_buf];
+
+    /* 2. Clear the newly flipped canvas */
     for (int i = 0; i < out->width * out->height; i++) {
         out->pixels[i] = COLOR_BG;
     }
 
-    /* 1. Think Pass */
+    /* 3. Think Pass */
     for (pbar_element_t **el = elements; *el != NULL; el++) {
         if ((*el)->think) {
             (*el)->think(*el);
         }
     }
 
-    /* 2. Render Pass */
+    /* 4. Render Pass */
     int x_offset = 0;
     for (pbar_element_t **el = elements; *el != NULL; el++) {
         if ((*el)->draw) {

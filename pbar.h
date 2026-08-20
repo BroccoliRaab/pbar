@@ -30,43 +30,11 @@ typedef struct {
 } pbar_text_t;
 
 /* --- Specialized / Derived Element Structs --- */
-
-/* Rectangle Element */
-typedef struct {
-    pbar_element_t base;   /* MUST be first */
-    uint32_t rect_width;
-    uint32_t color;
-} rect_element_t;
-
-/* Systray Element */
-typedef struct {
-    pbar_element_t base;   /* MUST be first */
-    uint32_t padding_x;
-} systray_element_t;
-
-/* Clock Element (Inherits from pbar_text_t) */
-typedef struct {
-    pbar_text_t text_base; /* MUST be first */
-    const char *format;    /* strftime format string */
-    char buffer[128];
-} clock_element_t;
-
-/* Exec Process Element (Inherits from pbar_text_t) */
-typedef struct {
-    pbar_text_t text_base; /* MUST be first */
-    const char *cmd;       /* Shell command to execute */
-    uint32_t interval_sec; /* Refresh interval in seconds */
-    time_t last_run;
-    char buffer[256];
-} exec_element_t;
-
-/* Label Element (Inherits from pbar_text_t) */
-typedef struct {
-    pbar_text_t text_base; /* MUST be first */
-    const char *badge;     /* Prepending badge/icon tag */
-    const char *payload;   /* The actual text content to wrap */
-    char buffer[256];
-} label_element_t;
+typedef struct { pbar_element_t base; uint32_t rect_width; uint32_t color; } rect_element_t;
+typedef struct { pbar_element_t base; uint32_t padding_x; } systray_element_t;
+typedef struct { pbar_text_t text_base; const char *format; char buffer[128]; } clock_element_t;
+typedef struct { pbar_text_t text_base; const char *cmd; uint32_t interval_sec; time_t last_run; char buffer[256]; } exec_element_t;
+typedef struct { pbar_text_t text_base; const char *badge; const char *payload; char buffer[256]; } label_element_t;
 
 /* --- Output State --- */
 struct pbar_output_s {
@@ -74,8 +42,12 @@ struct pbar_output_s {
     int x, y;
     int width, height;
     
-    uint32_t *pixels;
-    int shm_fd;
+    uint32_t *pixels;       /* Pointer to the currently active drawing buffer */
+    
+    /* Zero-copy SHM Double Buffering */
+    int shm_fd[2];
+    uint32_t *shm_pixels[2];
+    int current_buf;        /* 0 or 1 */
     int shm_size;
 
     void *b_state;
@@ -91,7 +63,7 @@ extern pbar_element_t *elements[];
 /* --- Inline Pixel Blending Helper --- */
 static inline uint32_t blend_pixel(uint32_t bg, uint32_t fg, uint8_t coverage) {
     uint32_t fg_a = (fg >> 24) & 0xFF;
-    if (fg_a == 0) fg_a = 255; /* Auto-correct if user provided RGB instead of ARGB in config.h */
+    if (fg_a == 0) fg_a = 255; 
     
     uint32_t alpha = (fg_a * coverage) / 255;
     if (alpha == 0) return bg;
