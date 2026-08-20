@@ -18,8 +18,8 @@ WAYLAND_OBJS    = $(wayland_OBJS)
 WAYLAND_HDRS    = $(wayland_HDRS)
 
 # X11 definitions
-x11_CFLAGS      = -DBUILD_X11
-x11_LDFLAGS     = -lxcb -lxcb-shm -lxcb-randr -lm
+x11_CFLAGS      = -DBUILD_X11 -I/usr/include/dbus-1.0 -I/usr/lib64/dbus-1.0/include 
+x11_LDFLAGS     = -lxcb -lxcb-shm -lxcb-randr -lm -ldbus-1
 x11_OBJS        =
 x11_HDRS        =
 

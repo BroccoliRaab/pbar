@@ -3,26 +3,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <poll.h>
 #include <signal.h>
-#include <errno.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
-#include "pbar.h"
 
-/* --- Globals --- */
+#include "pbar.h"
+#include "config.h"
+
+/* --- Backend API Declarations --- */
+uint32_t backend_systray_get_width(pbar_output_t *out);
+void backend_systray_draw(pbar_output_t *out, int x);
+int backend_run(void);
+
 volatile sig_atomic_t running = 1;
 pbar_output_t *outputs = NULL;
 int output_count = 0;
 
-/* Font State */
-static stbtt_fontinfo font_info;
+/* --- STB TrueType Globals --- */
 static unsigned char *font_buffer = NULL;
-static bool font_loaded = false;
+static stbtt_fontinfo font_info;
+static float font_scale;
+static int font_ascent, font_descent, font_line_gap;
 
 void die(const char *msg) {
     fprintf(stderr, "fatal: %s\n", msg);
@@ -34,366 +39,254 @@ static void handle_signal(int sig) {
     running = 0;
 }
 
+void pbar_font_init(const char *filename, float size) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) die("Failed to open font file.");
+    
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    font_buffer = malloc(sz);
+    if (fread(font_buffer, 1, sz, f) != (size_t)sz) die("Failed to read font file.");
+    fclose(f);
+    
+    if (!stbtt_InitFont(&font_info, font_buffer, stbtt_GetFontOffsetForIndex(font_buffer, 0))) {
+        die("Failed to initialize font.");
+    }
+    
+    font_scale = stbtt_ScaleForPixelHeight(&font_info, size);
+    stbtt_GetFontVMetrics(&font_info, &font_ascent, &font_descent, &font_line_gap);
+}
+
+int measure_text_width(const char *text) {
+    if (!text) return 0;
+    float w = 0.0f;
+    for (int i = 0; text[i]; i++) {
+        int advance, lsb;
+        stbtt_GetCodepointHMetrics(&font_info, text[i], &advance, &lsb);
+        w += advance * font_scale;
+        if (text[i+1]) {
+            w += font_scale * stbtt_GetCodepointKernAdvance(&font_info, text[i], text[i+1]);
+        }
+    }
+    return (int)w;
+}
+
+static void draw_text(pbar_output_t *out, int x, const char *text, uint32_t color) {
+    if (!text || !out || !out->pixels) return;
+
+    int text_height = (int)((font_ascent - font_descent) * font_scale);
+    int y_offset = (BAR_HEIGHT - text_height) / 2;
+    int baseline = y_offset + (int)(font_ascent * font_scale);
+    float xpos = (float)x;
+
+    for (int i = 0; text[i]; i++) {
+        int advance, lsb, x0, y0, x1, y1;
+        stbtt_GetCodepointHMetrics(&font_info, text[i], &advance, &lsb);
+        stbtt_GetCodepointBitmapBox(&font_info, text[i], font_scale, font_scale, &x0, &y0, &x1, &y1);
+        
+        int bw = x1 - x0;
+        int bh = y1 - y0;
+        
+        if (bw > 0 && bh > 0) {
+            unsigned char *bitmap = malloc(bw * bh);
+            stbtt_MakeCodepointBitmap(&font_info, bitmap, bw, bh, bw, font_scale, font_scale, text[i]);
+            
+            int cur_x = (int)xpos + x0;
+            int cur_y = baseline + y0;
+            
+            for (int row = 0; row < bh; row++) {
+                for (int col = 0; col < bw; col++) {
+                    int px = cur_x + col;
+                    int py = cur_y + row;
+                    if (px >= 0 && px < out->width && py >= 0 && py < out->height) {
+                        uint8_t alpha = bitmap[row * bw + col];
+                        if (alpha > 0) {
+                            int idx = py * out->width + px;
+                            out->pixels[idx] = blend_pixel(out->pixels[idx], color, alpha);
+                        }
+                    }
+                }
+            }
+            free(bitmap);
+        }
+        
+        xpos += (advance * font_scale);
+        if (text[i+1]) {
+            xpos += font_scale * stbtt_GetCodepointKernAdvance(&font_info, text[i], text[i+1]);
+        }
+    }
+}
+
 int init_shm(pbar_output_t *out) {
     out->shm_size = out->width * out->height * 4;
     out->current_buf = 0;
 
     for (int i = 0; i < 2; i++) {
         out->shm_fd[i] = memfd_create("pbar_pixels", MFD_CLOEXEC);
-        if (out->shm_fd[i] < 0) goto err;
-
-        if (ftruncate(out->shm_fd[i], out->shm_size) < 0) goto err;
+        if (out->shm_fd[i] < 0) return -1;
+        if (ftruncate(out->shm_fd[i], out->shm_size) < 0) return -1;
 
         out->shm_pixels[i] = mmap(NULL, out->shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, out->shm_fd[i], 0);
-        if (out->shm_pixels[i] == MAP_FAILED) {
-            out->shm_pixels[i] = NULL;
-            goto err;
-        }
-
+        if (out->shm_pixels[i] == MAP_FAILED) return -1;
         memset(out->shm_pixels[i], 0, out->shm_size);
     }
-
     out->pixels = out->shm_pixels[0];
     return 0;
-
-err:
-    for (int i = 0; i < 2; i++) {
-        if (out->shm_pixels[i]) munmap(out->shm_pixels[i], out->shm_size);
-        if (out->shm_fd[i] >= 0) close(out->shm_fd[i]);
-    }
-    return -1;
 }
 
-/* --- Display Server Injection --- */
-#if defined(BUILD_WAYLAND)
-    #include "backend_wayland.h"
-#elif defined(BUILD_X11)
-    #include "backend_x11.h"
-#else
-    #error "You must define either BUILD_WAYLAND or BUILD_X11 during compilation"
-#endif
-
-/* --- Font Initialization Helper --- */
-static bool ensure_font_loaded(void) {
-    if (font_loaded) return true;
-
-    FILE *f = fopen(FONT_PATH, "rb");
-    if (!f) return false;
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    font_buffer = malloc(size);
-    if (!font_buffer) {
-        fclose(f);
-        return false;
-    }
-
-    if (fread(font_buffer, 1, size, f) != (size_t)size) {
-        free(font_buffer);
-        font_buffer = NULL;
-        fclose(f);
-        return false;
-    }
-    fclose(f);
-
-    if (!stbtt_InitFont(&font_info, font_buffer, 0)) {
-        free(font_buffer);
-        font_buffer = NULL;
-        return false;
-    }
-
-    font_loaded = true;
-    return true;
-}
-
-/* ========================================================================= */
-/* --- Element Handlers & Logic ---                                          */
-/* ========================================================================= */
-
-/* --- Base Text Element Handlers --- */
-static void text_think(pbar_element_t *el) {
-    pbar_text_t *self = (pbar_text_t *)el;
-    
-    if (!ensure_font_loaded() || !self->text || self->text[0] == '\0') {
-        self->base.width = 0;
-        return;
-    }
-
-    float scale = stbtt_ScaleForPixelHeight(&font_info, FONT_SIZE);
-    float x_advance = 0.0f;
-
-    for (int i = 0; self->text[i] != '\0'; i++) {
-        int advance, lsb;
-        stbtt_GetCodepointHMetrics(&font_info, self->text[i], &advance, &lsb);
-        x_advance += advance * scale;
-
-        if (self->text[i + 1] != '\0') {
-            int kern = stbtt_GetCodepointKernAdvance(&font_info, self->text[i], self->text[i + 1]);
-            x_advance += kern * scale;
-        }
-    }
-
-    self->base.width = (uint32_t)(x_advance) + (self->padding_x * 2);
-}
-
-static void text_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
-    pbar_text_t *self = (pbar_text_t *)el;
-    if (!font_loaded || !self->text || self->base.width == 0) return;
-
-    float scale = stbtt_ScaleForPixelHeight(&font_info, FONT_SIZE);
-    int ascent, descent, line_gap;
-    stbtt_GetFontVMetrics(&font_info, &ascent, &descent, &line_gap);
-
-    /* Restored exact baseline formula from 3 iterations ago */
-    int baseline = (out->height + (int)((ascent + descent) * scale)) / 2;
-    float xpos = (float)(x_offset + self->padding_x);
-
-    for (int i = 0; self->text[i] != '\0'; i++) {
-        int advance, lsb;
-        stbtt_GetCodepointHMetrics(&font_info, self->text[i], &advance, &lsb);
-
-        int x0, y0, x1, y1;
-        stbtt_GetCodepointBitmapBox(&font_info, self->text[i], scale, scale, &x0, &y0, &x1, &y1);
-
-        int glyph_w = x1 - x0;
-        int glyph_h = y1 - y0;
-
-        if (glyph_w > 0 && glyph_h > 0) {
-            unsigned char *bmp = malloc(glyph_w * glyph_h);
-            if (bmp) {
-                stbtt_MakeCodepointBitmap(&font_info, bmp, glyph_w, glyph_h, glyph_w, scale, scale, self->text[i]);
-
-                int gx = (int)xpos + x0;
-                int gy = baseline + y0;
-
-                for (int row = 0; row < glyph_h; row++) {
-                    int py = gy + row;
-                    if (py < 0 || py >= out->height) continue;
-
-                    for (int col = 0; col < glyph_w; col++) {
-                        int px = gx + col;
-                        if (px < x_offset || px >= out->width || px >= (int)(x_offset + self->base.width)) continue;
-
-                        uint8_t alpha = bmp[row * glyph_w + col];
-                        if (alpha == 0) continue;
-
-                        uint32_t *dst = &out->pixels[py * out->width + px];
-                        *dst = blend_pixel(*dst, self->color, alpha);
-                    }
-                }
-                free(bmp);
-            }
-        }
-
-        xpos += advance * scale;
-
-        if (self->text[i + 1] != '\0') {
-            int kern = stbtt_GetCodepointKernAdvance(&font_info, self->text[i], self->text[i + 1]);
-            xpos += kern * scale;
-        }
-    }
-}
-
-/* --- Rectangle Element Handlers --- */
-static void rect_think(pbar_element_t *el) {
-    rect_element_t *self = (rect_element_t *)el;
-    self->base.width = self->rect_width;
-}
-
-static void rect_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
-    rect_element_t *self = (rect_element_t *)el;
-    if (!out || self->base.width == 0) return;
-
-    for (int y = 0; y < out->height; y++) {
-        for (uint32_t x = 0; x < self->base.width && (x_offset + x) < (uint32_t)out->width; x++) {
-            out->pixels[y * out->width + (x_offset + x)] = self->color;
-        }
-    }
-}
-
-/* --- Systray Element Handlers --- */
-static void systray_think(pbar_element_t *el) {
-    systray_element_t *self = (systray_element_t *)el;
-    uint32_t tray_w = backend_systray_get_width();
-    self->base.width = (tray_w > 0) ? (tray_w + self->padding_x * 2) : 0;
-}
-
-static void systray_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
-    systray_element_t *self = (systray_element_t *)el;
-    if (!out || self->base.width == 0) return;
-
-    for (int y = 0; y < out->height; y++) {
-        for (uint32_t x = 0; x < self->base.width && (x_offset + x) < (uint32_t)out->width; x++) {
-            out->pixels[y * out->width + (x_offset + x)] = COLOR_BG;
-        }
-    }
-
-    backend_systray_draw(out, x_offset + self->padding_x, self->base.width - (self->padding_x * 2));
-}
-
-/* --- Derived Text Element Handlers --- */
-
-/* 1. Clock Element Handler */
-static void clock_think(pbar_element_t *el) {
-    clock_element_t *self = (clock_element_t *)el;
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-
-    if (tm_info && self->format) {
-        strftime(self->buffer, sizeof(self->buffer), self->format, tm_info);
-        self->text_base.text = self->buffer;
-    }
-
-    text_think(el);
-}
-
-/* 2. Exec Process Element Handler */
-static void exec_think(pbar_element_t *el) {
-    exec_element_t *self = (exec_element_t *)el;
-    time_t now = time(NULL);
-
-    if (self->cmd && (self->interval_sec == 0 || (now - self->last_run) >= (time_t)self->interval_sec)) {
-        FILE *fp = popen(self->cmd, "r");
-        if (fp) {
-            if (fgets(self->buffer, sizeof(self->buffer), fp)) {
-                size_t len = strlen(self->buffer);
-                if (len > 0 && self->buffer[len - 1] == '\n') {
-                    self->buffer[len - 1] = '\0';
-                }
-                self->text_base.text = self->buffer;
-            } else {
-                self->text_base.text = "";
-            }
-            pclose(fp);
-        }
-        self->last_run = now;
-    }
-
-    text_think(el);
-}
-
-/* 3. Label Element Handler */
-static void label_think(pbar_element_t *el) {
-    label_element_t *self = (label_element_t *)el;
-    
-    /* Fixed: Reads from self->payload instead of self->buffer to prevent overlap undefined behavior */
-    snprintf(self->buffer, sizeof(self->buffer), "[%s] %s", 
-             self->badge ? self->badge : "SYS", 
-             self->payload ? self->payload : "");
-    self->text_base.text = self->buffer;
-
-    text_think(el);
-}
-
-/* ========================================================================= */
-/* --- Element Registry (Safe Static Declarations) ---                      */
-/* ========================================================================= */
-
-/* Moving these from file-scope compound literals to static objects prevents 
-   segfaults from compiler placing mutable buffers into .rodata */
-
-static pbar_text_t el_text = {
-    .base = { .think = text_think, .draw = text_draw, .width = 0 },
-    .text = "pbar v1.0",
-    .color = COLOR_TEXT,
-    .padding_x = 8
-};
-
-static rect_element_t el_rect = {
-    .base = { .think = rect_think, .draw = rect_draw, .width = 0 },
-    .rect_width = 2,
-    .color = 0xFF555555
-};
-
-static label_element_t el_label = {
-    .text_base = { .base = { .think = label_think, .draw = text_draw, .width = 0 }, .color = COLOR_TEXT, .padding_x = 8 },
-    .badge = "HOST",
-    .payload = "X11 Display",
-    .buffer = {0}
-};
-
-static exec_element_t el_exec = {
-    .text_base = { .base = { .think = exec_think, .draw = text_draw, .width = 0 }, .color = COLOR_TEXT, .padding_x = 8 },
-    .cmd = "uname -r",
-    .interval_sec = 60,
-    .last_run = 0,
-    .buffer = {0}
-};
-
-static clock_element_t el_clock = {
-    .text_base = { .base = { .think = clock_think, .draw = text_draw, .width = 0 }, .color = COLOR_TEXT, .padding_x = 8 },
-    .format = "%b %d %H:%M",
-    .buffer = {0}
-};
-
-static systray_element_t el_tray = {
-    .base = { .think = systray_think, .draw = systray_draw, .width = 0 },
-    .padding_x = 4
-};
-
-pbar_element_t *elements[] = {
-    (pbar_element_t *)&el_text,
-    (pbar_element_t *)&el_rect,
-    (pbar_element_t *)&el_label,
-    (pbar_element_t *)&el_rect,
-    (pbar_element_t *)&el_exec,
-    (pbar_element_t *)&el_rect,
-    (pbar_element_t *)&el_clock,
-    (pbar_element_t *)&el_tray,
-    NULL
-};
-
-/* ========================================================================= */
-/* --- Immediate Mode Drawing System ---                                     */
-/* ========================================================================= */
 void draw_output(pbar_output_t *out) {
     if (!out || out->width <= 0 || out->height <= 0) return;
 
-    /* 1. Swap buffer handles (Zero-copy flip) */
     out->current_buf = (out->current_buf + 1) % 2;
     out->pixels = out->shm_pixels[out->current_buf];
 
-    /* 2. Clear the newly flipped canvas */
     for (int i = 0; i < out->width * out->height; i++) {
         out->pixels[i] = COLOR_BG;
     }
 
-    /* 3. Think Pass */
-    for (pbar_element_t **el = elements; *el != NULL; el++) {
-        if ((*el)->think) {
-            (*el)->think(*el);
-        }
+    int left_w = 0, mid_w = 0, right_w = 0;
+
+    for (pbar_element_t **el = left_elements; *el; el++) {
+        if ((*el)->think) (*el)->think(*el, out);
+        left_w += (*el)->width;
+    }
+    for (pbar_element_t **el = middle_elements; *el; el++) {
+        if ((*el)->think) (*el)->think(*el, out);
+        mid_w += (*el)->width;
+    }
+    for (pbar_element_t **el = right_elements; *el; el++) {
+        if ((*el)->think) (*el)->think(*el, out);
+        right_w += (*el)->width;
     }
 
-    /* 4. Render Pass */
     int x_offset = 0;
-    for (pbar_element_t **el = elements; *el != NULL; el++) {
-        if ((*el)->draw) {
-            (*el)->draw(*el, out, x_offset);
-        }
-        
+
+    for (pbar_element_t **el = left_elements; *el; el++) {
+        if ((*el)->draw) (*el)->draw(*el, out, x_offset);
         x_offset += (*el)->width;
-        if (x_offset >= out->width) break; 
+    }
+
+    x_offset = (out->width / 2) - (mid_w / 2);
+    if (x_offset < left_w) x_offset = left_w;
+    
+    for (pbar_element_t **el = middle_elements; *el; el++) {
+        if ((*el)->draw) (*el)->draw(*el, out, x_offset);
+        x_offset += (*el)->width;
+    }
+
+    x_offset = out->width - right_w;
+    if (x_offset < (out->width / 2) + (mid_w / 2)) {
+        x_offset = (out->width / 2) + (mid_w / 2);
+    }
+
+    for (pbar_element_t **el = right_elements; *el; el++) {
+        if ((*el)->draw) (*el)->draw(*el, out, x_offset);
+        x_offset += (*el)->width;
     }
 }
 
+/* --- Element Implementations --- */
+
+void label_think(pbar_element_t *el, pbar_output_t *out) {
+    (void)out;
+    label_element_t *lbl = (label_element_t *)el;
+    if (lbl->badge && lbl->payload) {
+        snprintf(lbl->buffer, sizeof(lbl->buffer), "%s %s", lbl->badge, lbl->payload);
+        lbl->text_base.text = lbl->buffer;
+    }
+    if (lbl->text_base.text) {
+        el->width = measure_text_width(lbl->text_base.text) + (lbl->text_base.padding_x * 2);
+    }
+}
+
+void label_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
+    label_element_t *lbl = (label_element_t *)el;
+    if (lbl->text_base.text) draw_text(out, x_offset + lbl->text_base.padding_x, lbl->text_base.text, lbl->text_base.color);
+}
+
+void clock_think(pbar_element_t *el, pbar_output_t *out) {
+    (void)out;
+    clock_element_t *clk = (clock_element_t *)el;
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+    if (tm_info && clk->format) {
+        strftime(clk->buffer, sizeof(clk->buffer), clk->format, tm_info);
+        clk->text_base.text = clk->buffer;
+    }
+    if (clk->text_base.text) {
+        el->width = measure_text_width(clk->text_base.text) + (clk->text_base.padding_x * 2);
+    }
+}
+
+void clock_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
+    clock_element_t *clk = (clock_element_t *)el;
+    if (clk->text_base.text) draw_text(out, x_offset + clk->text_base.padding_x, clk->text_base.text, clk->text_base.color);
+}
+
+void exec_think(pbar_element_t *el, pbar_output_t *out) {
+    (void)out;
+    exec_element_t *ex = (exec_element_t *)el;
+    time_t now = time(NULL);
+    if (now - ex->last_run >= ex->interval_sec && ex->cmd) {
+        FILE *fp = popen(ex->cmd, "r");
+        if (fp) {
+            if (fgets(ex->buffer, sizeof(ex->buffer), fp)) {
+                ex->buffer[strcspn(ex->buffer, "\n")] = 0;
+                ex->text_base.text = ex->buffer;
+            }
+            pclose(fp);
+        }
+        ex->last_run = now;
+    }
+    if (ex->text_base.text) el->width = measure_text_width(ex->text_base.text) + (ex->text_base.padding_x * 2);
+}
+
+void exec_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
+    exec_element_t *ex = (exec_element_t *)el;
+    if (ex->text_base.text) draw_text(out, x_offset + ex->text_base.padding_x, ex->text_base.text, ex->text_base.color);
+}
+
+void rect_think(pbar_element_t *el, pbar_output_t *out) { 
+    (void)out;
+    el->width = ((rect_element_t *)el)->rect_width; 
+}
+
+void rect_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
+    rect_element_t *rect = (rect_element_t *)el;
+    for (int y = 4; y < out->height - 4; y++) {
+        for (int x = 0; x < rect->rect_width; x++) {
+            int px = x_offset + x;
+            if (px >= 0 && px < out->width) {
+                out->pixels[y * out->width + px] = blend_pixel(out->pixels[y * out->width + px], rect->color, 255);
+            }
+        }
+    }
+}
+
+void systray_think(pbar_element_t *el, pbar_output_t *out) {
+    systray_element_t *st = (systray_element_t *)el;
+    uint32_t tray_w = backend_systray_get_width(out); // Width returns 0 on non-tray monitors
+    el->width = (tray_w > 0) ? (tray_w + st->padding_x * 2) : 0;
+}
+
+void systray_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
+    systray_element_t *st = (systray_element_t *)el;
+    if (el->width <= 0) return;
+    
+    backend_systray_draw(out, x_offset + st->padding_x);
+}
+
+#ifdef BUILD_X11
+#include "backend_x11.h"
+#endif
+
 int main(void) {
-    int r = -1;
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
-    struct sigaction sa = { .sa_handler = handle_signal };
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
+    pbar_font_init(FONT_PATH, FONT_SIZE);
 
-    if (sigaction(SIGINT, &sa, NULL) < 0) goto out;
-    if (sigaction(SIGTERM, &sa, NULL) < 0) goto out;
-
-    if (backend_run() < 0) goto out;
-
-    r = 0;
-
-out:
-    if (font_buffer) free(font_buffer);
-    return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+    return backend_run();
 }

@@ -1,355 +1,286 @@
 #ifndef BACKEND_X11_H
 #define BACKEND_X11_H
 
-#include <xcb/xcb.h>
-#include <xcb/shm.h>
-#include <poll.h>
-#include <errno.h>
-#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <sys/mman.h>
+#include <sys/select.h>
+#include <xcb/xcb.h>
+#include <xcb/randr.h>
 
-/* XEmbed System Tray Opcodes */
-#define SYSTEM_TRAY_REQUEST_DOCK 0
-#define XEMBED_EMBEDDED_NOTIFY   0
+#include "pbar.h"
+#include "config.h"
 
-/* --- Backend Private State --- */
+/* --- System Tray State --- */
+static xcb_connection_t *tray_c = NULL;
+static xcb_window_t tray_win = 0;
+static xcb_atom_t opcode_atom = XCB_NONE;
 
-typedef struct {
-    xcb_window_t window;
-    xcb_gcontext_t gc;
-    xcb_shm_seg_t shm_seg[2];
-    bool mapped;
-} x11_state_t;
-
-typedef struct tray_client_s {
+typedef struct tray_icon {
     xcb_window_t win;
-    struct tray_client_s *next;
-} tray_client_t;
+    struct tray_icon *next;
+} tray_icon_t;
 
-static xcb_connection_t *conn = NULL;
-static xcb_screen_t *screen = NULL;
+static tray_icon_t *tray_icons = NULL;
+static int tray_icon_count = 0;
 
-static xcb_atom_t atom_net_system_tray = XCB_NONE;
-static xcb_atom_t atom_net_system_tray_opcode = XCB_NONE;
-static xcb_atom_t atom_xembed = XCB_NONE;
-static xcb_atom_t atom_xembed_info = XCB_NONE;
-
-static tray_client_t *tray_clients = NULL;
-
-static xcb_atom_t get_atom(const char *name) {
-    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 0, strlen(name), name);
-    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(conn, cookie, NULL);
+/* --- XCB Atom Helper --- */
+static inline xcb_atom_t backend_get_atom(xcb_connection_t *c, const char *name) {
+    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(c, 0, strlen(name), name);
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(c, cookie, NULL);
     if (!reply) return XCB_NONE;
     xcb_atom_t atom = reply->atom;
     free(reply);
     return atom;
 }
 
-static void x11_update(pbar_output_t *out) {
-    x11_state_t *st = out->b_state;
-    if (!st || !st->window || !out->pixels) return;
-
-    xcb_shm_put_image(
-        conn,
-        st->window,
-        st->gc,
-        out->width, out->height,
-        0, 0,
-        out->width, out->height,
-        0, 0,
-        24,
-        XCB_IMAGE_FORMAT_Z_PIXMAP,
-        0,
-        st->shm_seg[out->current_buf],
-        0
-    );
-    xcb_flush(conn);
+/* --- System Tray Manager Init & Events --- */
+static inline void x11_systray_init(xcb_connection_t *c, xcb_screen_t *screen, xcb_window_t win) {
+    tray_c = c;
+    tray_win = win;
+    
+    opcode_atom = backend_get_atom(c, "_NET_SYSTEM_TRAY_OPCODE");
+    xcb_atom_t tray_atom = backend_get_atom(c, "_NET_SYSTEM_TRAY_S0");
+    xcb_atom_t manager_atom = backend_get_atom(c, "MANAGER");
+    
+    xcb_set_selection_owner(c, win, tray_atom, XCB_CURRENT_TIME);
+    
+    xcb_client_message_event_t msg = {0};
+    msg.response_type = XCB_CLIENT_MESSAGE;
+    msg.format = 32;
+    msg.window = screen->root;
+    msg.type = manager_atom;
+    msg.data.data32[0] = XCB_CURRENT_TIME;
+    msg.data.data32[1] = tray_atom;
+    msg.data.data32[2] = win;
+    
+    xcb_send_event(c, 0, screen->root, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&msg);
+    xcb_flush(c);
 }
 
-/* --- X11 XEmbed System Tray Logic --- */
-
-static void add_tray_client(xcb_window_t client_win) {
-    for (tray_client_t *c = tray_clients; c; c = c->next) {
-        if (c->win == client_win) return;
-    }
-
-    tray_client_t *client = calloc(1, sizeof(tray_client_t));
-    if (!client) return;
-
-    client->win = client_win;
-
-    uint32_t mask = XCB_CW_EVENT_MASK;
-    uint32_t values[] = { XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE };
-    xcb_change_window_attributes(conn, client_win, mask, values);
-
-    client->next = tray_clients;
-    tray_clients = client;
-}
-
-static void remove_tray_client(xcb_window_t client_win) {
-    tray_client_t **curr = &tray_clients;
-    while (*curr) {
-        if ((*curr)->win == client_win) {
-            tray_client_t *tmp = *curr;
-            *curr = (*curr)->next;
-            free(tmp);
-            return;
+static inline void x11_systray_handle_event(xcb_generic_event_t *ev) {
+    if (!tray_c) return;
+    
+    uint8_t type = ev->response_type & ~0x80;
+    
+    if (type == XCB_CLIENT_MESSAGE) {
+        xcb_client_message_event_t *cme = (xcb_client_message_event_t *)ev;
+        if (cme->type == opcode_atom && cme->data.data32[1] == 0) {
+            xcb_window_t icon_win = cme->data.data32[2];
+            
+            xcb_reparent_window(tray_c, icon_win, tray_win, 0, 0);
+            
+            tray_icon_t *ti = malloc(sizeof(tray_icon_t));
+            ti->win = icon_win;
+            ti->next = tray_icons;
+            tray_icons = ti;
+            tray_icon_count++;
+            
+            xcb_map_window(tray_c, icon_win);
+            
+            uint32_t values[] = { XCB_EVENT_MASK_STRUCTURE_NOTIFY };
+            xcb_change_window_attributes(tray_c, icon_win, XCB_CW_EVENT_MASK, values);
         }
-        curr = &(*curr)->next;
-    }
-}
-
-static void init_x11_systray(pbar_output_t *out) {
-    x11_state_t *st = out->b_state;
-    if (!st) return;
-
-    char sel_name[64];
-    snprintf(sel_name, sizeof(sel_name), "_NET_SYSTEM_TRAY_S%d", 0);
-
-    atom_net_system_tray = get_atom(sel_name);
-    atom_net_system_tray_opcode = get_atom("_NET_SYSTEM_TRAY_OPCODE");
-    atom_xembed = get_atom("_XEMBED");
-    atom_xembed_info = get_atom("_XEMBED_INFO");
-
-    xcb_set_selection_owner(conn, st->window, atom_net_system_tray, XCB_TIME_CURRENT_TIME);
-
-    xcb_get_selection_owner_cookie_t cookie = xcb_get_selection_owner(conn, atom_net_system_tray);
-    xcb_get_selection_owner_reply_t *reply = xcb_get_selection_owner_reply(conn, cookie, NULL);
-
-    if (reply && reply->owner == st->window) {
-        xcb_client_message_event_t ev = {
-            .response_type = XCB_CLIENT_MESSAGE,
-            .format = 32,
-            .window = screen->root,
-            .type = get_atom("MANAGER"),
-            .data.data32 = {
-                XCB_TIME_CURRENT_TIME,
-                atom_net_system_tray,
-                st->window,
-                0, 0
+    } else if (type == XCB_DESTROY_NOTIFY || type == XCB_UNMAP_NOTIFY) {
+        xcb_destroy_notify_event_t *dne = (xcb_destroy_notify_event_t *)ev;
+        tray_icon_t **curr = &tray_icons;
+        while (*curr) {
+            if ((*curr)->win == dne->window) {
+                tray_icon_t *tmp = *curr;
+                *curr = (*curr)->next;
+                free(tmp);
+                tray_icon_count--;
+                break;
             }
-        };
-
-        xcb_send_event(conn, 0, screen->root, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&ev);
+            curr = &(*curr)->next;
+        }
     }
-    free(reply);
 }
 
-/* --- Systray Backend Contract Implementation --- */
+/* --- Backend API implemented for pbar.c --- */
 
-static uint32_t backend_systray_get_width(void) {
-    int count = 0;
-    for (tray_client_t *c = tray_clients; c; c = c->next) count++;
-
-    if (count == 0) return 0;
-    return count * TRAY_ICON_SIZE + (count - 1) * TRAY_ICON_SPACING + (TRAY_PADDING_X * 2);
+uint32_t backend_systray_get_width(pbar_output_t *out) {
+    /* If this specific monitor is NOT the tray monitor, return 0 width! */
+    if (!tray_c || out->b_state != (void*)(uintptr_t)tray_win) return 0;
+    return (tray_icon_count > 0) ? (tray_icon_count * TRAY_ICON_SIZE + (tray_icon_count - 1) * TRAY_ICON_SPACING) : 0;
 }
 
-static void backend_systray_draw(pbar_output_t *out, int x_offset, uint32_t width) {
-    (void)width;
-    x11_state_t *st = out->b_state;
-    if (!st || !st->window) return;
-
-    int cur_x = x_offset + TRAY_PADDING_X;
-    int cur_y = (out->height - TRAY_ICON_SIZE) / 2;
-    if (cur_y < 0) cur_y = 0;
-
-    for (tray_client_t *c = tray_clients; c; c = c->next) {
-        xcb_reparent_window(conn, c->win, st->window, cur_x, cur_y);
-
-        uint32_t values[] = { cur_x, cur_y, TRAY_ICON_SIZE, TRAY_ICON_SIZE };
-        xcb_configure_window(conn, c->win, 
-            XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, 
-            values);
-
-        xcb_map_window(conn, c->win);
-
-        xcb_client_message_event_t xev = {
-            .response_type = XCB_CLIENT_MESSAGE,
-            .format = 32,
-            .window = c->win,
-            .type = atom_xembed,
-            .data.data32 = { XCB_TIME_CURRENT_TIME, XEMBED_EMBEDDED_NOTIFY, 0, st->window, 0 }
-        };
-        xcb_send_event(conn, 0, c->win, XCB_EVENT_MASK_NO_EVENT, (const char *)&xev);
-
-        cur_x += TRAY_ICON_SIZE + TRAY_ICON_SPACING;
+void backend_systray_draw(pbar_output_t *out, int x) {
+    if (!tray_c || out->b_state != (void*)(uintptr_t)tray_win) return;
+    
+    int current_x = x;
+    for (tray_icon_t *icon = tray_icons; icon; icon = icon->next) {
+        uint32_t values[] = { current_x, (BAR_HEIGHT - TRAY_ICON_SIZE) / 2, TRAY_ICON_SIZE, TRAY_ICON_SIZE };
+        xcb_configure_window(tray_c, icon->win, 
+            XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | 
+            XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+        current_x += TRAY_ICON_SIZE + TRAY_ICON_SPACING;
     }
-    xcb_flush(conn);
 }
 
-/* --- Backend Entry Point --- */
+/* --- Window Manager Struts --- */
+static inline void set_window_strut(xcb_connection_t *c, xcb_window_t win, int x, int width) {
+    xcb_atom_t net_wm_strut_partial = backend_get_atom(c, "_NET_WM_STRUT_PARTIAL");
+    xcb_atom_t net_wm_strut = backend_get_atom(c, "_NET_WM_STRUT");
+    xcb_atom_t net_wm_window_type = backend_get_atom(c, "_NET_WM_WINDOW_TYPE");
+    xcb_atom_t net_wm_window_type_dock = backend_get_atom(c, "_NET_WM_WINDOW_TYPE_DOCK");
 
-static int backend_run(void) {
-    int r = -1;
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_window_type, XCB_ATOM_ATOM, 32, 1, &net_wm_window_type_dock);
 
-    conn = xcb_connect(NULL, NULL);
-    if (xcb_connection_has_error(conn)) {
-        die("could not connect to X11 display");
-        goto out;
+    uint32_t strut[12] = {0};
+    strut[2] = BAR_HEIGHT;          
+    strut[8] = x;                   
+    strut[9] = x + width - 1;       
+
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_strut_partial, XCB_ATOM_CARDINAL, 32, 12, strut);
+    
+    uint32_t strut_simple[4] = {0, 0, BAR_HEIGHT, 0};
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_strut, XCB_ATOM_CARDINAL, 32, 4, strut_simple);
+}
+
+/* --- Main XCB Loop --- */
+int backend_run(void) {
+    int screen_nbr;
+    xcb_connection_t *c = xcb_connect(NULL, &screen_nbr);
+    if (xcb_connection_has_error(c)) die("Cannot open XCB connection");
+
+    xcb_screen_iterator_t iter = xcb_setup_roots_iterator(xcb_get_setup(c));
+    for (int i = 0; i < screen_nbr; ++i) xcb_screen_next(&iter);
+    xcb_screen_t *screen = iter.data;
+
+    xcb_gcontext_t gc = xcb_generate_id(c);
+    uint32_t gc_mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND;
+    uint32_t gc_values[] = { screen->black_pixel, screen->white_pixel };
+    xcb_create_gc(c, gc, screen->root, gc_mask, gc_values);
+
+    xcb_randr_query_version_cookie_t v_cookie = xcb_randr_query_version(c, 1, 1);
+    xcb_randr_query_version_reply_t *v_reply = xcb_randr_query_version_reply(c, v_cookie, NULL);
+    if (v_reply) free(v_reply);
+
+    xcb_randr_get_screen_resources_current_cookie_t res_cookie = xcb_randr_get_screen_resources_current(c, screen->root);
+    xcb_randr_get_screen_resources_current_reply_t *res = xcb_randr_get_screen_resources_current_reply(c, res_cookie, NULL);
+    if (!res) die("Failed to get XRandR screen resources");
+
+    int id_counter = 0;
+    int output_len = xcb_randr_get_screen_resources_current_outputs_length(res);
+    xcb_randr_output_t *r_outputs = xcb_randr_get_screen_resources_current_outputs(res);
+
+    xcb_window_t target_tray_win = 0; /* Keep track of the chosen systray parent */
+
+    for (int i = 0; i < output_len; i++) {
+        xcb_randr_get_output_info_cookie_t out_cookie = xcb_randr_get_output_info(c, r_outputs[i], res->config_timestamp);
+        xcb_randr_get_output_info_reply_t *out_info = xcb_randr_get_output_info_reply(c, out_cookie, NULL);
+
+        if (out_info && out_info->crtc != XCB_NONE && out_info->connection == XCB_RANDR_CONNECTION_CONNECTED) {
+            xcb_randr_get_crtc_info_cookie_t crtc_cookie = xcb_randr_get_crtc_info(c, out_info->crtc, res->config_timestamp);
+            xcb_randr_get_crtc_info_reply_t *crtc = xcb_randr_get_crtc_info_reply(c, crtc_cookie, NULL);
+
+            if (crtc) {
+                int name_len = xcb_randr_get_output_info_name_length(out_info);
+                uint8_t *name_ptr = xcb_randr_get_output_info_name(out_info);
+                char name[256];
+                snprintf(name, sizeof(name), "%.*s", name_len, name_ptr);
+
+                int should_draw = 0;
+                if (target_monitors[0] == NULL) {
+                    should_draw = 1;
+                } else {
+                    for (int m = 0; target_monitors[m] != NULL; m++) {
+                        if (strcmp(name, target_monitors[m]) == 0) {
+                            should_draw = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (should_draw) {
+                    pbar_output_t *out = calloc(1, sizeof(pbar_output_t));
+                    out->id = ++id_counter;
+                    out->x = crtc->x;
+                    out->y = crtc->y;
+                    out->width = crtc->width;
+                    out->height = BAR_HEIGHT;
+                    
+                    if (init_shm(out) < 0) die("Failed to initialize SHM buffer");
+
+                    xcb_window_t win = xcb_generate_id(c);
+                    uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+                    uint32_t values[] = {
+                        COLOR_BG, 1, 
+                        XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY
+                    };
+
+                    xcb_create_window(c, XCB_COPY_FROM_PARENT, win, screen->root,
+                        out->x, out->y, out->width, out->height, 0,
+                        XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
+                        mask, values);
+
+                    set_window_strut(c, win, out->x, out->width);
+                    xcb_map_window(c, win);
+                    out->b_state = (void *)(uintptr_t)win;
+
+                    /* Assign target tray monitor if it matches config */
+                    #ifdef SYSTRAY_MONITOR
+                    if (strcmp(name, SYSTRAY_MONITOR) == 0) {
+                        target_tray_win = win;
+                    }
+                    #endif
+                    
+                    /* Fallback: If not specified, use the first generated monitor */
+                    if (!target_tray_win) {
+                        target_tray_win = win;
+                    }
+
+                    out->next = outputs;
+                    outputs = out;
+                    output_count++;
+                }
+                free(crtc);
+            }
+        }
+        if (out_info) free(out_info);
+    }
+    free(res);
+
+    if (output_count == 0) die("No matching monitors found.");
+
+    /* Initialize systray strictly on the designated window */
+    if (target_tray_win) {
+        x11_systray_init(c, screen, target_tray_win);
     }
 
-    screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
-    if (!screen) {
-        die("failed to retrieve X11 screen");
-        goto out_conn;
-    }
-
-    pbar_output_t *out_node = calloc(1, sizeof(pbar_output_t));
-    if (!out_node) goto out_conn;
-
-    out_node->b_state = calloc(1, sizeof(x11_state_t));
-    if (!out_node->b_state) { free(out_node); goto out_conn; }
-
-    out_node->id = 0;
-    out_node->width = screen->width_in_pixels;
-    out_node->height = BAR_HEIGHT;
-    out_node->next = outputs;
-    outputs = out_node;
-    output_count = 1;
-
-    x11_state_t *st = out_node->b_state;
-
-    if (init_shm(out_node) < 0) {
-        die("failed to initialize SHM buffers for X11 output");
-        goto out_conn;
-    }
-
-    /* Attach BOTH memfd segments to the X server */
-    for (int i = 0; i < 2; i++) {
-        st->shm_seg[i] = xcb_generate_id(conn);
-        xcb_shm_attach_fd(conn, st->shm_seg[i], out_node->shm_fd[i], 0);
-    }
-
-    /* Create X11 Bar Window */
-    st->window = xcb_generate_id(conn);
-    uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
-    uint32_t values[2] = {
-        COLOR_BG,
-        XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
-    };
-
-    xcb_create_window(
-        conn,
-        XCB_COPY_FROM_PARENT,
-        st->window,
-        screen->root,
-        0, 0,
-        out_node->width, out_node->height,
-        0,
-        XCB_WINDOW_CLASS_INPUT_OUTPUT,
-        screen->root_visual,
-        mask, values
-    );
-
-    st->gc = xcb_generate_id(conn);
-    xcb_create_gc(conn, st->gc, st->window, 0, NULL);
-
-    /* Set Window Manager Dock Properties */
-    xcb_atom_t atom_type = get_atom("_NET_WM_WINDOW_TYPE");
-    xcb_atom_t atom_dock = get_atom("_NET_WM_WINDOW_TYPE_DOCK");
-    xcb_change_property(conn, XCB_PROP_MODE_REPLACE, st->window, atom_type, XCB_ATOM_ATOM, 32, 1, &atom_dock);
-
-    /* Reserve desktop space at top */
-    xcb_atom_t atom_strut = get_atom("_NET_WM_STRUT_PARTIAL");
-    uint32_t strut[12] = { 0, 0, BAR_HEIGHT, 0, 0, 0, 0, 0, 0, out_node->width, 0, 0 };
-    xcb_change_property(conn, XCB_PROP_MODE_REPLACE, st->window, atom_strut, XCB_ATOM_CARDINAL, 32, 12, strut);
-
-    init_x11_systray(out_node);
-
-    xcb_map_window(conn, st->window);
-    xcb_flush(conn);
-
-    int x11_fd = xcb_get_file_descriptor(conn);
-    struct pollfd pfd = { .fd = x11_fd, .events = POLLIN };
+    int xcb_fd = xcb_get_file_descriptor(c);
 
     while (running) {
-        if (poll(&pfd, 1, 1000) < 0) {
-            if (errno == EINTR && !running) break;
-            continue;
-        }
-
         xcb_generic_event_t *ev;
-        while ((ev = xcb_poll_for_event(conn))) {
-            uint8_t response = ev->response_type & ~0x80;
-
-            switch (response) {
-            case XCB_CLIENT_MESSAGE: {
-                xcb_client_message_event_t *cme = (xcb_client_message_event_t *)ev;
-                if (cme->type == atom_net_system_tray_opcode && cme->data.data32[1] == SYSTEM_TRAY_REQUEST_DOCK) {
-                    add_tray_client(cme->data.data32[2]);
-                }
-                break;
-            }
-
-            case XCB_DESTROY_NOTIFY: {
-                xcb_destroy_notify_event_t *dne = (xcb_destroy_notify_event_t *)ev;
-                remove_tray_client(dne->window);
-                break;
-            }
-
-            case XCB_UNMAP_NOTIFY: {
-                xcb_unmap_notify_event_t *une = (xcb_unmap_notify_event_t *)ev;
-                remove_tray_client(une->window);
-                break;
-            }
-
-            default:
-                break;
-            }
-
+        while ((ev = xcb_poll_for_event(c))) {
+            x11_systray_handle_event(ev); 
             free(ev);
         }
 
-        /* Draw handles the pointer swap internally, then x11_update reads the new buffer */
-        draw_output(out_node);
-        x11_update(out_node);
-    }
-
-    r = 0;
-
-out_conn:
-    for (tray_client_t *c = tray_clients; c; ) {
-        tray_client_t *next = c->next;
-        free(c);
-        c = next;
-    }
-    tray_clients = NULL;
-
-    for (pbar_output_t *out = outputs; out; ) {
-        pbar_output_t *next = out->next;
-        x11_state_t *state = out->b_state;
-        
-        if (state) {
-            if (state->gc) xcb_free_gc(conn, state->gc);
-            if (state->window) xcb_destroy_window(conn, state->window);
+        for (pbar_output_t *out = outputs; out != NULL; out = out->next) {
+            draw_output(out);
             
-            /* Detach BOTH memfd segments */
-            for (int i = 0; i < 2; i++) {
-                if (state->shm_seg[i]) {
-                    xcb_shm_detach(conn, state->shm_seg[i]);
-                }
-            }
-            free(state);
+            xcb_window_t win = (xcb_window_t)(uintptr_t)out->b_state;
+            xcb_put_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, win, gc,
+                          out->width, out->height, 0, 0, 0, screen->root_depth,
+                          out->width * out->height * 4, (uint8_t *)out->pixels);
         }
         
-        /* Unmap and close BOTH buffers cleanly */
-        for (int i = 0; i < 2; i++) {
-            if (out->shm_pixels[i]) munmap(out->shm_pixels[i], out->shm_size);
-            if (out->shm_fd[i] >= 0) close(out->shm_fd[i]);
-        }
-        
-        free(out);
-        out = next;
+        xcb_flush(c);
+
+        fd_set in_fds;
+        FD_ZERO(&in_fds);
+        FD_SET(xcb_fd, &in_fds);
+
+        struct timeval tv;
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        select(xcb_fd + 1, &in_fds, NULL, NULL, &tv);
     }
-    outputs = NULL;
 
-    if (conn) xcb_disconnect(conn);
-
-out:
-    return r;
+    xcb_disconnect(c);
+    return 0;
 }
 
 #endif /* BACKEND_X11_H */
