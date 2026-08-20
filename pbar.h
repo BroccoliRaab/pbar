@@ -37,8 +37,8 @@ typedef struct {
     text_element_t text_base;
     char *cmd;
     int interval_sec;
-    time_t last_run;
-    char buffer[256];
+    time_t last_run[16];      // Indexed by monitor ID (1-15)
+    char buffer[16][256];     // Indexed by monitor ID (1-15)
 } exec_element_t;
 
 typedef struct {
@@ -54,6 +54,7 @@ typedef struct {
 
 typedef struct pbar_output_t {
     int id;
+    char name[64];
     int x;
     int y;
     int width;

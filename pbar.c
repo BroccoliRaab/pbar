@@ -226,26 +226,44 @@ void clock_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
 }
 
 void exec_think(pbar_element_t *el, pbar_output_t *out) {
-    (void)out;
     exec_element_t *ex = (exec_element_t *)el;
     time_t now = time(NULL);
-    if (now - ex->last_run >= ex->interval_sec && ex->cmd) {
+    
+    // Use monitor ID directly (bounds check 1 to 15)
+    int id = (out->id > 0 && out->id < 16) ? out->id : 1;
+
+    if (now - ex->last_run[id] >= ex->interval_sec && ex->cmd) {
+        // Set environment variables uniquely for this monitor's execution
+        char id_str[16];
+        snprintf(id_str, sizeof(id_str), "%d", out->id);
+        
+        setenv("PBAR_MONITOR_NAME", out->name, 1);
+        setenv("PBAR_MONITOR_ID", id_str, 1);
+
         FILE *fp = popen(ex->cmd, "r");
         if (fp) {
-            if (fgets(ex->buffer, sizeof(ex->buffer), fp)) {
-                ex->buffer[strcspn(ex->buffer, "\n")] = 0;
-                ex->text_base.text = ex->buffer;
+            if (fgets(ex->buffer[id], sizeof(ex->buffer[id]), fp)) {
+                ex->buffer[id][strcspn(ex->buffer[id], "\n")] = 0;
             }
             pclose(fp);
         }
-        ex->last_run = now;
+        ex->last_run[id] = now;
     }
-    if (ex->text_base.text) el->width = measure_text_width(ex->text_base.text) + (ex->text_base.padding_x * 2);
+    
+    // Point text to this monitor's specific buffer
+    ex->text_base.text = ex->buffer[id];
+    
+    if (ex->text_base.text) {
+        el->width = measure_text_width(ex->text_base.text) + (ex->text_base.padding_x * 2);
+    }
 }
 
 void exec_draw(pbar_element_t *el, pbar_output_t *out, int x_offset) {
     exec_element_t *ex = (exec_element_t *)el;
-    if (ex->text_base.text) draw_text(out, x_offset + ex->text_base.padding_x, ex->text_base.text, ex->text_base.color);
+    int id = (out->id > 0 && out->id < 16) ? out->id : 1;
+    if (ex->buffer[id][0] != '\0') {
+        draw_text(out, x_offset + ex->text_base.padding_x, ex->buffer[id], ex->text_base.color);
+    }
 }
 
 void rect_think(pbar_element_t *el, pbar_output_t *out) { 

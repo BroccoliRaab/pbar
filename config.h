@@ -47,7 +47,7 @@ pbar_element_t *left_elements[] = {
             .color = 0xFF88AAFF,
             .padding_x = 10
         },
-        .cmd = "uname -r",
+        .cmd = "echo $PBAR_MONITOR_ID",
         .interval_sec = 60
     },
     NULL

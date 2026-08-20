@@ -179,15 +179,14 @@ int backend_run(void) {
             if (crtc) {
                 int name_len = xcb_randr_get_output_info_name_length(out_info);
                 uint8_t *name_ptr = xcb_randr_get_output_info_name(out_info);
-                char name[256];
-                snprintf(name, sizeof(name), "%.*s", name_len, name_ptr);
+
 
                 int should_draw = 0;
                 if (target_monitors[0] == NULL) {
                     should_draw = 1;
                 } else {
                     for (int m = 0; target_monitors[m] != NULL; m++) {
-                        if (strcmp(name, target_monitors[m]) == 0) {
+                        if (strcmp(name_ptr, target_monitors[m]) == 0) {
                             should_draw = 1;
                             break;
                         }
@@ -196,6 +195,7 @@ int backend_run(void) {
 
                 if (should_draw) {
                     pbar_output_t *out = calloc(1, sizeof(pbar_output_t));
+                    snprintf(out->name, sizeof(out->name), "%.*s", name_len, name_ptr);
                     out->id = ++id_counter;
                     out->x = crtc->x;
                     out->y = crtc->y;
@@ -222,7 +222,7 @@ int backend_run(void) {
 
                     /* Assign target tray monitor if it matches config */
                     #ifdef SYSTRAY_MONITOR
-                    if (strcmp(name, SYSTRAY_MONITOR) == 0) {
+                    if (strcmp(out->name, SYSTRAY_MONITOR) == 0) {
                         target_tray_win = win;
                     }
                     #endif
