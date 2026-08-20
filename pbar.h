@@ -3,37 +3,116 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <signal.h>
+#include <time.h>
 #include "config.h"
 
-/* --- Types --- */
+/* --- Core Types & Forward Declarations --- */
 typedef struct pbar_output_s pbar_output_t;
+typedef struct pbar_element_s pbar_element_t;
+
+typedef void (*pbar_think)(pbar_element_t *el);
+typedef void (*pbar_draw)(pbar_element_t *el, pbar_output_t *out, int x_offset);
+
+/* 1. Base Element Struct */
+struct pbar_element_s {
+    pbar_think think;
+    pbar_draw draw;
+    uint32_t width;
+};
+
+/* 2. Base Text Element (Inherits from pbar_element_t) */
+typedef struct {
+    pbar_element_t base;   /* MUST be first */
+    const char *text;
+    uint32_t color;
+    int padding_x;
+} pbar_text_t;
+
+/* --- Specialized / Derived Element Structs --- */
+
+/* Rectangle Element */
+typedef struct {
+    pbar_element_t base;   /* MUST be first */
+    uint32_t rect_width;
+    uint32_t color;
+} rect_element_t;
+
+/* Systray Element */
+typedef struct {
+    pbar_element_t base;   /* MUST be first */
+    uint32_t padding_x;
+} systray_element_t;
+
+/* Clock Element (Inherits from pbar_text_t) */
+typedef struct {
+    pbar_text_t text_base; /* MUST be first */
+    const char *format;    /* strftime format string */
+    char buffer[128];
+} clock_element_t;
+
+/* Exec Process Element (Inherits from pbar_text_t) */
+typedef struct {
+    pbar_text_t text_base; /* MUST be first */
+    const char *cmd;       /* Shell command to execute */
+    uint32_t interval_sec; /* Refresh interval in seconds */
+    time_t last_run;
+    char buffer[256];
+} exec_element_t;
+
+/* Label Element (Inherits from pbar_text_t) */
+typedef struct {
+    pbar_text_t text_base; /* MUST be first */
+    const char *badge;     /* Prepending badge/icon tag */
+    const char *payload;   /* The actual text content to wrap */
+    char buffer[256];
+} label_element_t;
+
+/* --- Output State --- */
 struct pbar_output_s {
     int id;
     int x, y;
     int width, height;
     
-    /* Shared Memory Pixel Buffer */
     uint32_t *pixels;
     int shm_fd;
     int shm_size;
 
-    /* Backend specific state */
     void *b_state;
-
     pbar_output_t *next;
 };
 
 /* --- Globals --- */
-extern bool running;
+extern volatile sig_atomic_t running;
 extern pbar_output_t *outputs;
 extern int output_count;
+extern pbar_element_t *elements[];
 
-/* --- Common API --- */
+/* --- Inline Pixel Blending Helper --- */
+static inline uint32_t blend_pixel(uint32_t bg, uint32_t fg, uint8_t coverage) {
+    uint32_t fg_a = (fg >> 24) & 0xFF;
+    if (fg_a == 0) fg_a = 255; /* Auto-correct if user provided RGB instead of ARGB in config.h */
+    
+    uint32_t alpha = (fg_a * coverage) / 255;
+    if (alpha == 0) return bg;
+    if (alpha == 255) return fg;
+
+    uint32_t inv_a = 255 - alpha;
+    uint32_t r = (((fg >> 16) & 0xFF) * alpha + ((bg >> 16) & 0xFF) * inv_a) / 255;
+    uint32_t g = (((fg >> 8) & 0xFF) * alpha + ((bg >> 8) & 0xFF) * inv_a) / 255;
+    uint32_t b = (((fg) & 0xFF) * alpha + ((bg & 0xFF) * inv_a)) / 255;
+
+    return (0xFF000000) | (r << 16) | (g << 8) | b;
+}
+
+/* --- Common Core API --- */
 void die(const char *msg);
 int  init_shm(pbar_output_t *out);
 void draw_output(pbar_output_t *out);
 
-/* --- Backend API --- */
-static int backend_run(void);
+/* --- Backend Abstraction Contract --- */
+static int      backend_run(void);
+static uint32_t backend_systray_get_width(void);
+static void     backend_systray_draw(pbar_output_t *out, int x_offset, uint32_t width);
 
 #endif /* PBAR_H */

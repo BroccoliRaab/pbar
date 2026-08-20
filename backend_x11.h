@@ -3,247 +3,341 @@
 
 #include <xcb/xcb.h>
 #include <xcb/shm.h>
-#include <xcb/randr.h>
+#include <poll.h>
 #include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+/* XEmbed System Tray Opcodes */
+#define SYSTEM_TRAY_REQUEST_DOCK 0
+#define XEMBED_EMBEDDED_NOTIFY   0
+
+/* --- Backend Private State --- */
 
 typedef struct {
-    xcb_window_t x_win;
-    xcb_shm_seg_t x_shm_seg;
+    xcb_window_t window;
+    xcb_gcontext_t gc;
+    xcb_shm_seg_t shm_seg;
+    bool mapped;
 } x11_state_t;
 
-static xcb_connection_t *x_conn;
-static xcb_screen_t *x_screen;
-static xcb_gcontext_t x_gc;
+typedef struct tray_client_s {
+    xcb_window_t win;
+    struct tray_client_s *next;
+} tray_client_t;
+
+static xcb_connection_t *conn = NULL;
+static xcb_screen_t *screen = NULL;
+
+static xcb_atom_t atom_net_system_tray = XCB_NONE;
+static xcb_atom_t atom_net_system_tray_opcode = XCB_NONE;
+static xcb_atom_t atom_xembed = XCB_NONE;
+static xcb_atom_t atom_xembed_info = XCB_NONE;
+
+static tray_client_t *tray_clients = NULL;
+
+static xcb_atom_t get_atom(const char *name) {
+    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 0, strlen(name), name);
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(conn, cookie, NULL);
+    if (!reply) return XCB_NONE;
+    xcb_atom_t atom = reply->atom;
+    free(reply);
+    return atom;
+}
 
 static void x11_update(pbar_output_t *out) {
     x11_state_t *st = out->b_state;
-    /* Use dynamic root_depth instead of hardcoding 24 */
-    xcb_shm_put_image(x_conn, st->x_win, x_gc, out->width, out->height,
-                      0, 0, out->width, out->height, 0, 0, x_screen->root_depth,
-                      XCB_IMAGE_FORMAT_Z_PIXMAP, 0, st->x_shm_seg, 0);
-    xcb_flush(x_conn);
+    if (!st || !st->window || !out->pixels) return;
+
+    xcb_shm_put_image(
+        conn,
+        st->window,
+        st->gc,
+        out->width, out->height,
+        0, 0,
+        out->width, out->height,
+        0, 0,
+        24,
+        XCB_IMAGE_FORMAT_Z_PIXMAP,
+        0,
+        st->shm_seg,
+        0
+    );
+    xcb_flush(conn);
 }
+
+/* --- X11 XEmbed System Tray Logic --- */
+
+static void add_tray_client(xcb_window_t client_win) {
+    for (tray_client_t *c = tray_clients; c; c = c->next) {
+        if (c->win == client_win) return;
+    }
+
+    tray_client_t *client = calloc(1, sizeof(tray_client_t));
+    if (!client) return;
+
+    client->win = client_win;
+
+    uint32_t mask = XCB_CW_EVENT_MASK;
+    uint32_t values[] = { XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE };
+    xcb_change_window_attributes(conn, client_win, mask, values);
+
+    client->next = tray_clients;
+    tray_clients = client;
+}
+
+static void remove_tray_client(xcb_window_t client_win) {
+    tray_client_t **curr = &tray_clients;
+    while (*curr) {
+        if ((*curr)->win == client_win) {
+            tray_client_t *tmp = *curr;
+            *curr = (*curr)->next;
+            free(tmp);
+            return;
+        }
+        curr = &(*curr)->next;
+    }
+}
+
+static void init_x11_systray(pbar_output_t *out) {
+    x11_state_t *st = out->b_state;
+    if (!st) return;
+
+    char sel_name[64];
+    snprintf(sel_name, sizeof(sel_name), "_NET_SYSTEM_TRAY_S%d", 0);
+
+    atom_net_system_tray = get_atom(sel_name);
+    atom_net_system_tray_opcode = get_atom("_NET_SYSTEM_TRAY_OPCODE");
+    atom_xembed = get_atom("_XEMBED");
+    atom_xembed_info = get_atom("_XEMBED_INFO");
+
+    xcb_set_selection_owner(conn, st->window, atom_net_system_tray, XCB_TIME_CURRENT_TIME);
+
+    xcb_get_selection_owner_cookie_t cookie = xcb_get_selection_owner(conn, atom_net_system_tray);
+    xcb_get_selection_owner_reply_t *reply = xcb_get_selection_owner_reply(conn, cookie, NULL);
+
+    if (reply && reply->owner == st->window) {
+        xcb_client_message_event_t ev = {
+            .response_type = XCB_CLIENT_MESSAGE,
+            .format = 32,
+            .window = screen->root,
+            .type = get_atom("MANAGER"),
+            .data.data32 = {
+                XCB_TIME_CURRENT_TIME,
+                atom_net_system_tray,
+                st->window,
+                0, 0
+            }
+        };
+
+        xcb_send_event(conn, 0, screen->root, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&ev);
+    }
+    free(reply);
+}
+
+/* --- Systray Backend Contract Implementation --- */
+
+static uint32_t backend_systray_get_width(void) {
+    int count = 0;
+    for (tray_client_t *c = tray_clients; c; c = c->next) count++;
+
+    if (count == 0) return 0;
+    return count * TRAY_ICON_SIZE + (count - 1) * TRAY_ICON_SPACING + (TRAY_PADDING_X * 2);
+}
+
+static void backend_systray_draw(pbar_output_t *out, int x_offset, uint32_t width) {
+    (void)width;
+    x11_state_t *st = out->b_state;
+    if (!st || !st->window) return;
+
+    int cur_x = x_offset + TRAY_PADDING_X;
+    int cur_y = (out->height - TRAY_ICON_SIZE) / 2;
+    if (cur_y < 0) cur_y = 0;
+
+    for (tray_client_t *c = tray_clients; c; c = c->next) {
+        xcb_reparent_window(conn, c->win, st->window, cur_x, cur_y);
+
+        uint32_t values[] = { cur_x, cur_y, TRAY_ICON_SIZE, TRAY_ICON_SIZE };
+        xcb_configure_window(conn, c->win, 
+            XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, 
+            values);
+
+        xcb_map_window(conn, c->win);
+
+        xcb_client_message_event_t xev = {
+            .response_type = XCB_CLIENT_MESSAGE,
+            .format = 32,
+            .window = c->win,
+            .type = atom_xembed,
+            .data.data32 = { XCB_TIME_CURRENT_TIME, XEMBED_EMBEDDED_NOTIFY, 0, st->window, 0 }
+        };
+        xcb_send_event(conn, 0, c->win, XCB_EVENT_MASK_NO_EVENT, (const char *)&xev);
+
+        cur_x += TRAY_ICON_SIZE + TRAY_ICON_SPACING;
+    }
+    xcb_flush(conn);
+}
+
+/* --- Backend Entry Point --- */
 
 static int backend_run(void) {
     int r = -1;
 
-    xcb_intern_atom_reply_t *r_type = NULL;
-    xcb_intern_atom_reply_t *r_dock = NULL;
-    xcb_intern_atom_reply_t *r_state = NULL;
-    xcb_intern_atom_reply_t *r_sticky = NULL;
-    xcb_intern_atom_reply_t *r_above = NULL;
-    xcb_intern_atom_reply_t *r_desk = NULL;
-    xcb_intern_atom_reply_t *r_strut = NULL;
-    xcb_intern_atom_reply_t *r_strut_p = NULL;
-
-    x_conn = xcb_connect(NULL, NULL);
-    if (xcb_connection_has_error(x_conn)) {
-        die("could not connect to X11");
+    conn = xcb_connect(NULL, NULL);
+    if (xcb_connection_has_error(conn)) {
+        die("could not connect to X11 display");
         goto out;
     }
 
-    x_screen = xcb_setup_roots_iterator(xcb_get_setup(x_conn)).data;
-    if (!x_screen) {
-        die("could not get X11 screen");
+    screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+    if (!screen) {
+        die("failed to retrieve X11 screen");
         goto out_conn;
     }
 
-    x_gc = xcb_generate_id(x_conn);
-    xcb_create_gc(x_conn, x_gc, x_screen->root, 0, NULL);
+    pbar_output_t *out_node = calloc(1, sizeof(pbar_output_t));
+    if (!out_node) goto out_conn;
 
-    /* Monitor Query via RandR */
-    xcb_randr_get_screen_resources_current_cookie_t res_c =
-        xcb_randr_get_screen_resources_current(x_conn, x_screen->root);
-    xcb_randr_get_screen_resources_current_reply_t *res_r =
-        xcb_randr_get_screen_resources_current_reply(x_conn, res_c, NULL);
+    out_node->b_state = calloc(1, sizeof(x11_state_t));
+    if (!out_node->b_state) { free(out_node); goto out_conn; }
 
-    if (!res_r) {
-        die("failed to get xrandr resources");
-        goto out_gc;
+    out_node->id = 0;
+    out_node->width = screen->width_in_pixels;
+    out_node->height = BAR_HEIGHT;
+    out_node->next = outputs;
+    outputs = out_node;
+    output_count = 1;
+
+    x11_state_t *st = out_node->b_state;
+
+    /* Use unified init_shm (memfd) */
+    if (init_shm(out_node) < 0) {
+        die("failed to initialize SHM buffer for X11 output");
+        goto out_conn;
     }
 
-    xcb_randr_crtc_t *crtcs = xcb_randr_get_screen_resources_current_crtcs(res_r);
-    int crtc_len = xcb_randr_get_screen_resources_current_crtcs_length(res_r);
+    /* Attach modern X11 memfd-backed shared memory via FD extension */
+    st->shm_seg = xcb_generate_id(conn);
+    xcb_shm_attach_fd(conn, st->shm_seg, out_node->shm_fd, 0);
 
-    for (int i = 0; i < crtc_len; i++) {
-        xcb_randr_get_crtc_info_reply_t *crtc = xcb_randr_get_crtc_info_reply(
-            x_conn, xcb_randr_get_crtc_info(x_conn, crtcs[i], res_r->config_timestamp), NULL);
-
-        if (crtc && crtc->width > 0) {
-            if (TARGET_MONITOR == -1 || TARGET_MONITOR == output_count) {
-                pbar_output_t *out_node = calloc(1, sizeof(pbar_output_t));
-                if (!out_node) { free(crtc); goto out_res; }
-                out_node->b_state = calloc(1, sizeof(x11_state_t));
-                if (!out_node->b_state) { free(out_node); free(crtc); goto out_res; }
-
-                out_node->id = output_count;
-                out_node->x = crtc->x;
-                out_node->y = crtc->y;
-                out_node->width = crtc->width;
-                out_node->height = BAR_HEIGHT;
-
-                out_node->next = outputs;
-                outputs = out_node;
-            }
-            output_count++;
-        }
-        free(crtc);
-    }
-
-    #define GET_ATOM(name) xcb_intern_atom_reply(x_conn, xcb_intern_atom(x_conn, 0, strlen(name), name), NULL)
-    r_type    = GET_ATOM("_NET_WM_WINDOW_TYPE");
-    r_dock    = GET_ATOM("_NET_WM_WINDOW_TYPE_DOCK");
-    r_state   = GET_ATOM("_NET_WM_STATE");
-    r_sticky  = GET_ATOM("_NET_WM_STATE_STICKY");
-    r_above   = GET_ATOM("_NET_WM_STATE_ABOVE");
-    r_desk    = GET_ATOM("_NET_WM_DESKTOP");
-    r_strut   = GET_ATOM("_NET_WM_STRUT");
-    r_strut_p = GET_ATOM("_NET_WM_STRUT_PARTIAL");
-    #undef GET_ATOM
-
-    /* Setup Windows */
-    for (pbar_output_t *out_node = outputs; out_node; out_node = out_node->next) {
-        x11_state_t *st = out_node->b_state;
-        st->x_win = xcb_generate_id(x_conn);
-
-        uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
-        uint32_t values[2] = { x_screen->black_pixel, XCB_EVENT_MASK_EXPOSURE };
-
-        xcb_create_window(x_conn, XCB_COPY_FROM_PARENT, st->x_win, x_screen->root,
-                          out_node->x, out_node->y, out_node->width, out_node->height, 0,
-                          XCB_WINDOW_CLASS_INPUT_OUTPUT, x_screen->root_visual, mask, values);
-
-        xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                            XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, 10, "pbar\0pbar");
-
-        if (r_type && r_dock) {
-            xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                r_type->atom, XCB_ATOM_ATOM, 32, 1, &r_dock->atom);
-        }
-
-        if (r_desk) {
-            uint32_t all_desks = 0xFFFFFFFF;
-            xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                r_desk->atom, XCB_ATOM_CARDINAL, 32, 1, &all_desks);
-        }
-
-        if (r_state && r_sticky && r_above) {
-            xcb_atom_t states[2] = { r_sticky->atom, r_above->atom };
-            xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                r_state->atom, XCB_ATOM_ATOM, 32, 2, states);
-        }
-
-        uint32_t top_reserve = out_node->y + out_node->height;
-        if (r_strut) {
-            uint32_t strut[4] = { 0, 0, top_reserve, 0 };
-            xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                r_strut->atom, XCB_ATOM_CARDINAL, 32, 4, strut);
-        }
-
-        if (r_strut_p) {
-            uint32_t strut_p[12] = { 0 };
-            strut_p[2] = top_reserve;
-            strut_p[8] = out_node->x;
-            strut_p[9] = out_node->x + out_node->width - 1;
-            xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                r_strut_p->atom, XCB_ATOM_CARDINAL, 32, 12, strut_p);
-        }
-
-        xcb_flush(x_conn);
-
-        if (init_shm(out_node) < 0) {
-            die("failed to initialize SHM buffer");
-            goto out_res;
-        }
-
-        st->x_shm_seg = xcb_generate_id(x_conn);
-        /* Use xcb_shm_attach_fd to properly pass POSIX File Descriptors */
-        xcb_shm_attach_fd(x_conn, st->x_shm_seg, out_node->shm_fd, 0);
-        xcb_map_window(x_conn, st->x_win);
-
-        draw_output(out_node);
-        x11_update(out_node);
-    }
-    xcb_flush(x_conn);
-
-    /* Main Event Loop */
-    struct pollfd pfd = {
-        .fd = xcb_get_file_descriptor(x_conn),
-        .events = POLLIN
+    /* Create X11 Bar Window */
+    st->window = xcb_generate_id(conn);
+    uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+    uint32_t values[2] = {
+        COLOR_BG,
+        XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
     };
 
+    xcb_create_window(
+        conn,
+        XCB_COPY_FROM_PARENT,
+        st->window,
+        screen->root,
+        0, 0,
+        out_node->width, out_node->height,
+        0,
+        XCB_WINDOW_CLASS_INPUT_OUTPUT,
+        screen->root_visual,
+        mask, values
+    );
+
+    st->gc = xcb_generate_id(conn);
+    xcb_create_gc(conn, st->gc, st->window, 0, NULL);
+
+    /* Set Window Manager Dock Properties */
+    xcb_atom_t atom_type = get_atom("_NET_WM_WINDOW_TYPE");
+    xcb_atom_t atom_dock = get_atom("_NET_WM_WINDOW_TYPE_DOCK");
+    xcb_change_property(conn, XCB_PROP_MODE_REPLACE, st->window, atom_type, XCB_ATOM_ATOM, 32, 1, &atom_dock);
+
+    /* Reserve desktop space at top */
+    xcb_atom_t atom_strut = get_atom("_NET_WM_STRUT_PARTIAL");
+    uint32_t strut[12] = { 0, 0, BAR_HEIGHT, 0, 0, 0, 0, 0, 0, out_node->width, 0, 0 };
+    xcb_change_property(conn, XCB_PROP_MODE_REPLACE, st->window, atom_strut, XCB_ATOM_CARDINAL, 32, 12, strut);
+
+    init_x11_systray(out_node);
+
+    xcb_map_window(conn, st->window);
+    xcb_flush(conn);
+
+    int x11_fd = xcb_get_file_descriptor(conn);
+    struct pollfd pfd = { .fd = x11_fd, .events = POLLIN };
+
     while (running) {
-        int poll_ret = poll(&pfd, 1, -1);
-        if (poll_ret < 0) {
+        /* Wake up at least every 1000ms so clock and exec elements can update */
+        if (poll(&pfd, 1, 1000) < 0) {
             if (errno == EINTR && !running) break;
             continue;
         }
 
-        if (pfd.revents & POLLIN) {
-            xcb_generic_event_t *ev;
-            while ((ev = xcb_poll_for_event(x_conn))) {
-                if ((ev->response_type & ~0x80) == XCB_EXPOSE) {
-                    xcb_expose_event_t *expose = (xcb_expose_event_t *)ev;
-                    for (pbar_output_t *out_node = outputs; out_node; out_node = out_node->next) {
-                        x11_state_t *st = out_node->b_state;
-                        if (st->x_win == expose->window) {
-                            x11_update(out_node);
-                            break;
-                        }
-                    }
+        xcb_generic_event_t *ev;
+        while ((ev = xcb_poll_for_event(conn))) {
+            uint8_t response = ev->response_type & ~0x80;
+
+            switch (response) {
+            case XCB_CLIENT_MESSAGE: {
+                xcb_client_message_event_t *cme = (xcb_client_message_event_t *)ev;
+                if (cme->type == atom_net_system_tray_opcode && cme->data.data32[1] == SYSTEM_TRAY_REQUEST_DOCK) {
+                    add_tray_client(cme->data.data32[2]);
                 }
-                free(ev);
+                break;
             }
+
+            case XCB_DESTROY_NOTIFY: {
+                xcb_destroy_notify_event_t *dne = (xcb_destroy_notify_event_t *)ev;
+                remove_tray_client(dne->window);
+                break;
+            }
+
+            case XCB_UNMAP_NOTIFY: {
+                xcb_unmap_notify_event_t *une = (xcb_unmap_notify_event_t *)ev;
+                remove_tray_client(une->window);
+                break;
+            }
+
+            default:
+                break;
+            }
+
+            free(ev);
         }
+
+        /* Unconditionally redraw the bar (handles XCB_EXPOSE naturally, plus clock ticks) */
+        draw_output(out_node);
+        x11_update(out_node);
     }
 
     r = 0;
 
-out_res:
-    for (pbar_output_t *out_node = outputs; out_node; ) {
-        pbar_output_t *next = out_node->next;
-        x11_state_t *st = out_node->b_state;
+out_conn:
+    for (tray_client_t *c = tray_clients; c; ) {
+        tray_client_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    tray_clients = NULL;
+
+    for (pbar_output_t *out = outputs; out; ) {
+        pbar_output_t *next = out->next;
+        x11_state_t *st = out->b_state;
         if (st) {
-            if (st->x_win) {
-                if (r_strut && r_strut->atom) {
-                    uint32_t zero_strut[4] = { 0 };
-                    xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                        r_strut->atom, XCB_ATOM_CARDINAL, 32, 4, zero_strut);
-                }
-                if (r_strut_p && r_strut_p->atom) {
-                    uint32_t zero_strut_p[12] = { 0 };
-                    xcb_change_property(x_conn, XCB_PROP_MODE_REPLACE, st->x_win,
-                                        r_strut_p->atom, XCB_ATOM_CARDINAL, 32, 12, zero_strut_p);
-                }
-
-                xcb_unmap_window(x_conn, st->x_win);
-
-                xcb_flush(x_conn);
-                free(xcb_get_input_focus_reply(x_conn, xcb_get_input_focus(x_conn), NULL));
-
-                if (st->x_shm_seg) xcb_shm_detach(x_conn, st->x_shm_seg);
-                xcb_destroy_window(x_conn, st->x_win);
-            }
+            if (st->shm_seg) xcb_shm_detach(conn, st->shm_seg);
+            if (st->gc) xcb_free_gc(conn, st->gc);
+            if (st->window) xcb_destroy_window(conn, st->window);
             free(st);
         }
-        if (out_node->pixels) munmap(out_node->pixels, out_node->shm_size);
-        if (out_node->shm_fd >= 0) close(out_node->shm_fd);
-        free(out_node);
-        out_node = next;
+        
+        /* Cleanup memfd mappings unified by init_shm */
+        if (out->pixels) munmap(out->pixels, out->shm_size);
+        if (out->shm_fd >= 0) close(out->shm_fd);
+        
+        free(out);
+        out = next;
     }
     outputs = NULL;
 
-    free(res_r);
-    free(r_type); free(r_dock); free(r_state);
-    free(r_sticky); free(r_above); free(r_desk);
-    free(r_strut); free(r_strut_p);
-
-out_gc:
-    xcb_free_gc(x_conn, x_gc);
-
-out_conn:
-    xcb_flush(x_conn);
-    xcb_disconnect(x_conn);
+    if (conn) xcb_disconnect(conn);
 
 out:
     return r;

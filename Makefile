@@ -19,7 +19,7 @@ WAYLAND_HDRS    = $(wayland_HDRS)
 
 # X11 definitions
 x11_CFLAGS      = -DBUILD_X11
-x11_LDFLAGS     = -lxcb -lxcb-shm -lxcb-randr
+x11_LDFLAGS     = -lxcb -lxcb-shm -lxcb-randr -lm
 x11_OBJS        =
 x11_HDRS        =
 
