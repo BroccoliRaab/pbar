@@ -205,7 +205,7 @@ int backend_run(void) {
                     if (init_shm(out) < 0) die("Failed to initialize SHM buffer");
 
                     xcb_window_t win = xcb_generate_id(c);
-                    uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+                    uint32_t mask = XCB_CW_BACK_PIXEL |  XCB_CW_EVENT_MASK;
                     uint32_t values[] = {
                         COLOR_BG, 1, 
                         XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY

@@ -19,27 +19,19 @@
 /* Add the X11 names of the monitors you want to draw to (e.g., "eDP-1", "DP-1").
  * If the first item is NULL, the bar will draw on ALL connected monitors. */
 static const char *target_monitors[] = {
-    "DisplayPort-0",
-    "DisplayPort-2",
     NULL
 };
 
 /* --- Left Aligned Elements --- */
 pbar_element_t *left_elements[] = {
-    (pbar_element_t *) &(label_element_t) {
+    (pbar_element_t *) &(exec_element_t) {
         .text_base = {
-            .base = { .think = label_think, .draw = label_draw },
-            .text = "Workspace 1",
-            .color = COLOR_FG,
+            .base = { .think = exec_think, .draw = exec_draw },
+            .color = 0xFF88AAFF,
             .padding_x = 10
         },
-        .badge = "WS:",
-        .payload = "1"
-    },
-    (pbar_element_t *) &(rect_element_t) {
-        .base = { .think = rect_think, .draw = rect_draw },
-        .rect_width = 2,
-        .color = 0xFF555555
+        .cmd = "echo $PBAR_MONITOR_NAME",
+        .interval_sec = 60
     },
     (pbar_element_t *) &(exec_element_t) {
         .text_base = {
@@ -47,8 +39,8 @@ pbar_element_t *left_elements[] = {
             .color = 0xFF88AAFF,
             .padding_x = 10
         },
-        .cmd = "echo $PBAR_MONITOR_ID",
-        .interval_sec = 60
+        .cmd = "bspc query -D -m $PBAR_MONITOR_NAME --names -d .active",
+        .interval_sec = 1
     },
     NULL
 };
@@ -62,7 +54,7 @@ pbar_element_t *middle_elements[] = {
             .color = COLOR_FG,
             .padding_x = 10
         },
-        .format = "%Y-%m-%d %H:%M:%S"
+        .format = "%A %b %d %r"
     },
     NULL
 };
