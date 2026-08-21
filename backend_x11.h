@@ -118,27 +118,34 @@ void backend_systray_draw(pbar_output_t *out, int x) {
         current_x += TRAY_ICON_SIZE + TRAY_ICON_SPACING;
     }
 }
-
-/* --- Window Manager Struts --- */
 static inline void set_window_strut(xcb_connection_t *c, xcb_window_t win, int x, int width) {
-    xcb_atom_t net_wm_strut_partial = backend_get_atom(c, "_NET_WM_STRUT_PARTIAL");
-    xcb_atom_t net_wm_strut = backend_get_atom(c, "_NET_WM_STRUT");
     xcb_atom_t net_wm_window_type = backend_get_atom(c, "_NET_WM_WINDOW_TYPE");
     xcb_atom_t net_wm_window_type_dock = backend_get_atom(c, "_NET_WM_WINDOW_TYPE_DOCK");
-
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_window_type, XCB_ATOM_ATOM, 32, 1, &net_wm_window_type_dock);
 
+    // --- NEW: Force the bar to the bottom layer so fullscreen apps can cover it ---
+    xcb_atom_t net_wm_state = backend_get_atom(c, "_NET_WM_STATE");
+    xcb_atom_t net_wm_state_below = backend_get_atom(c, "_NET_WM_STATE_BELOW");
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_state, XCB_ATOM_ATOM, 32, 1, &net_wm_state_below);
+
+    uint32_t stack_values[] = { XCB_STACK_MODE_BELOW };
+    xcb_configure_window(c, win, XCB_CONFIG_WINDOW_STACK_MODE, stack_values);
+    // -----------------------------------------------------------------------------
+
+    // Set Partial Strut (reserves screen space at the top)
     uint32_t strut[12] = {0};
     strut[2] = BAR_HEIGHT;          
     strut[8] = x;                   
     strut[9] = x + width - 1;       
 
+    xcb_atom_t net_wm_strut_partial = backend_get_atom(c, "_NET_WM_STRUT_PARTIAL");
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_strut_partial, XCB_ATOM_CARDINAL, 32, 12, strut);
     
+    // Fallback standard strut for older WMs
     uint32_t strut_simple[4] = {0, 0, BAR_HEIGHT, 0};
+    xcb_atom_t net_wm_strut = backend_get_atom(c, "_NET_WM_STRUT");
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, net_wm_strut, XCB_ATOM_CARDINAL, 32, 4, strut_simple);
 }
-
 /* --- Main XCB Loop --- */
 int backend_run(void) {
     int screen_nbr;
